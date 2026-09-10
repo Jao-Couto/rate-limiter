@@ -1,0 +1,342 @@
+# Distributed rate limiter — final design
+#
+#   client  ->  N api gateways (token bucket + Lua)  ->  server
+#                     |                    |
+#                zookeeper            redis cluster (3 masters + 3 replicas)
+#              (live rule config)     (bucket state, consistent hashing)
+#
+# Static IPs are required: Redis Cluster gossips the address each node
+# announces, so nodes must advertise something stable and routable.
+
+name: rate-limiter
+
+x-node-build: &node-build
+  context: .
+  dockerfile: Dockerfile
+
+x-gateway-env: &gateway-env
+  NODE_ENV: ${NODE_ENV:-development}
+  PORT: 3000
+  UPSTREAM_URL: http://server:4000
+  # Seed nodes only — the cluster client discovers the rest via CLUSTER SLOTS.
+  REDIS_CLUSTER_NODES: 172.28.0.11:6379,172.28.0.12:6379,172.28.0.13:6379
+  ZOOKEEPER_CONNECT: zookeeper:2181
+  ZK_RULES_PATH: ${ZK_RULES_PATH:-/rate-limiter/rules}
+  # fail-closed: reject when Redis is unreachable, so a Redis outage
+  # cannot turn into an unthrottled stampede on the backend.
+  FAIL_MODE: ${FAIL_MODE:-closed}
+  DEFAULT_BUCKET_CAPACITY: ${DEFAULT_BUCKET_CAPACITY:-10}
+  DEFAULT_REFILL_PER_SEC: ${DEFAULT_REFILL_PER_SEC:-5}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
+x-gateway: &gateway
+  build:
+    <<: *node-build
+    args:
+      SERVICE: gateway
+  restart: unless-stopped
+  depends_on:
+    redis-cluster-init:
+      condition: service_completed_successfully
+    zookeeper-init:
+      condition: service_completed_successfully
+    server:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+    interval: 10s
+    timeout: 3s
+    retries: 5
+    start_period: 20s
+  networks: [ratelimiter]
+
+x-redis-node: &redis-node
+  image: redis:7.4-alpine
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "redis-cli", "-p", "6379", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
+services:
+  # ---------------------------------------------------------------- backend
+  server:
+    build:
+      <<: *node-build
+      args:
+        SERVICE: server
+    restart: unless-stopped
+    environment:
+      NODE_ENV: ${NODE_ENV:-development}
+      PORT: 4000
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${SERVER_PORT:-4000}:4000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [ratelimiter]
+
+  # ------------------------------------------------------------ api gateways
+  # Declared individually (not `deploy.replicas`) so each one keeps a stable
+  # host port and a distinct GATEWAY_ID — you want to be able to kill exactly
+  # one and watch the buckets stay consistent across the survivors.
+  gateway-1:
+    <<: *gateway
+    environment:
+      <<: *gateway-env
+      GATEWAY_ID: gateway-1
+    ports:
+      - "${GATEWAY_1_PORT:-3001}:3000"
+
+  gateway-2:
+    <<: *gateway
+    environment:
+      <<: *gateway-env
+      GATEWAY_ID: gateway-2
+    ports:
+      - "${GATEWAY_2_PORT:-3002}:3000"
+
+  gateway-3:
+    <<: *gateway
+    environment:
+      <<: *gateway-env
+      GATEWAY_ID: gateway-3
+    ports:
+      - "${GATEWAY_3_PORT:-3003}:3000"
+
+  # ----------------------------------------------------------- redis cluster
+  redis-1:
+    <<: *redis-node
+    container_name: rl-redis-1
+    command: >
+      redis-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 172.28.0.11
+      --cluster-announce-port 6379
+      --cluster-announce-bus-port 16379
+      --appendonly no
+      --save ""
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis-1-data:/data
+    networks:
+      ratelimiter:
+        ipv4_address: 172.28.0.11
+
+  redis-2:
+    <<: *redis-node
+    container_name: rl-redis-2
+    command: >
+      redis-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 172.28.0.12
+      --cluster-announce-port 6379
+      --cluster-announce-bus-port 16379
+      --appendonly no
+      --save ""
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis-2-data:/data
+    networks:
+      ratelimiter:
+        ipv4_address: 172.28.0.12
+
+  redis-3:
+    <<: *redis-node
+    container_name: rl-redis-3
+    command: >
+      redis-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 172.28.0.13
+      --cluster-announce-port 6379
+      --cluster-announce-bus-port 16379
+      --appendonly no
+      --save ""
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis-3-data:/data
+    networks:
+      ratelimiter:
+        ipv4_address: 172.28.0.13
+
+  redis-4:
+    <<: *redis-node
+    container_name: rl-redis-4
+    command: >
+      redis-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 172.28.0.14
+      --cluster-announce-port 6379
+      --cluster-announce-bus-port 16379
+      --appendonly no
+      --save ""
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis-4-data:/data
+    networks:
+      ratelimiter:
+        ipv4_address: 172.28.0.14
+
+  redis-5:
+    <<: *redis-node
+    container_name: rl-redis-5
+    command: >
+      redis-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 172.28.0.15
+      --cluster-announce-port 6379
+      --cluster-announce-bus-port 16379
+      --appendonly no
+      --save ""
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis-5-data:/data
+    networks:
+      ratelimiter:
+        ipv4_address: 172.28.0.15
+
+  redis-6:
+    <<: *redis-node
+    container_name: rl-redis-6
+    command: >
+      redis-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-ip 172.28.0.16
+      --cluster-announce-port 6379
+      --cluster-announce-bus-port 16379
+      --appendonly no
+      --save ""
+      --maxmemory 256mb
+      --maxmemory-policy volatile-lru
+    volumes:
+      - redis-6-data:/data
+    networks:
+      ratelimiter:
+        ipv4_address: 172.28.0.16
+
+  # Forms the 16384 hash slots into 3 masters + 1 replica each. Idempotent:
+  # re-running against an already-formed cluster is a no-op.
+  redis-cluster-init:
+    image: redis:7.4-alpine
+    restart: "no"
+    depends_on:
+      redis-1: { condition: service_healthy }
+      redis-2: { condition: service_healthy }
+      redis-3: { condition: service_healthy }
+      redis-4: { condition: service_healthy }
+      redis-5: { condition: service_healthy }
+      redis-6: { condition: service_healthy }
+    volumes:
+      - ./scripts/redis-cluster-init.sh:/redis-cluster-init.sh:ro
+    entrypoint: ["sh", "/redis-cluster-init.sh"]
+    networks: [ratelimiter]
+
+  # -------------------------------------------------------------- zookeeper
+  # Single node: this is the config plane, not the data plane. Swap in a
+  # 3-node ensemble when you want to exercise leader election.
+  zookeeper:
+    image: zookeeper:3.9
+    container_name: rl-zookeeper
+    restart: unless-stopped
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_SERVERS: server.1=zookeeper:2888:3888;2181
+      ZOO_4LW_COMMANDS_WHITELIST: srvr,mntr,ruok,conf,stat
+      ZOO_ADMINSERVER_ENABLED: "false"
+    ports:
+      - "${ZOOKEEPER_PORT:-2181}:2181"
+    volumes:
+      - zookeeper-data:/data
+      - zookeeper-datalog:/datalog
+    healthcheck:
+      test: ["CMD-SHELL", "zkServer.sh status 2>&1 | grep -q Mode:"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks: [ratelimiter]
+
+  # Seeds the rules znode so gateways have something to watch on first boot.
+  zookeeper-init:
+    image: zookeeper:3.9
+    restart: "no"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      ZK_RULES_PATH: ${ZK_RULES_PATH:-/rate-limiter/rules}
+      DEFAULT_BUCKET_CAPACITY: ${DEFAULT_BUCKET_CAPACITY:-10}
+      DEFAULT_REFILL_PER_SEC: ${DEFAULT_REFILL_PER_SEC:-5}
+    volumes:
+      - ./scripts/zookeeper-init.sh:/zookeeper-init.sh:ro
+    entrypoint: ["bash", "/zookeeper-init.sh"]
+    networks: [ratelimiter]
+
+  # ----------------------------------------------------------------- client
+  # Load generator. Spreads requests across the gateways itself, so no extra
+  # load balancer is in the picture. Runs once and exits.
+  client:
+    build:
+      <<: *node-build
+      args:
+        SERVICE: client
+    restart: "no"
+    profiles: [load]
+    depends_on:
+      gateway-1: { condition: service_healthy }
+      gateway-2: { condition: service_healthy }
+      gateway-3: { condition: service_healthy }
+    environment:
+      GATEWAY_URLS: http://gateway-1:3000,http://gateway-2:3000,http://gateway-3:3000
+      TARGET_PATH: ${TARGET_PATH:-/api/resource}
+      CLIENT_IDS: ${CLIENT_IDS:-alice,bob,carol}
+      RPS: ${RPS:-30}
+      DURATION_SEC: ${DURATION_SEC:-15}
+    networks: [ratelimiter]
+
+networks:
+  ratelimiter:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+
+volumes:
+  redis-1-data:
+  redis-2-data:
+  redis-3-data:
+  redis-4-data:
+  redis-5-data:
+  redis-6-data:
+  zookeeper-data:
+  zookeeper-datalog:
